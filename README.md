@@ -2,43 +2,38 @@
 
 Built with Claude Code + GPT-5.
 
-Gob-framed transport for Go's net/rpc with unary and bidirectional streaming. It reuses net/rpc concurrency/lifecycle and only replaces the wire format and per-call stream semantics. Each frame is a standalone gob value (no length prefix). See DESIGN.md for details.
-
+Gob-framed transport for Go's net/rpc with unary and bidirectional streaming. It reuses net/rpc concurrency/lifecycle and only replaces the wire format and per-call stream semantics. Each frame is a standalone gob value (no length prefix).
 > Experimental project: an attempt to layer bidirectional streaming RPC over the standard net/rpc package using custom ClientCodec/ServerCodec and a simple gob-framed protocol. Not production-ready. APIs and the wire format may change without notice.
 
-Status: Draft · Version: v0.9-gob
+Status: Experimental
 
 ## Why this exists
-- Explore whether net/rpc can support streaming semantics (client→server, server→client, bidi) without changing its registration/call model
-- Reuse net/rpc’s proven concurrency, request lifecycle and multiplexing, while experimenting with a minimal, self-delimiting wire format (gob frames)
+- Add streaming (client→server, server→client, bidi) to net/rpc without changing the registration/call model
+- Reuse net/rpc concurrency/lifecycle; try a minimal, self‑delimiting gob‑framed transport
 
 ## Non-goals
-- Not a drop-in replacement for gRPC or HTTP/2-based systems
-- No built-in security (TLS/mTLS/auth), service discovery or load balancing
-- No production-grade flow control yet (WINDOW_UPDATE is reserved but disabled)
-- No backward-compatibility guarantee for the wire format during experimentation
+- Not a drop‑in replacement for gRPC/HTTP/2 stacks
+- No built-in security, service discovery, or load balancing
 
 ## Features
-- Unary plus three streaming modes: client→server, server→client, bidirectional
 - Simple wire protocol: a single `frame` type, gob-encoded with self-delimiting boundaries
+- Unary + streaming: client→server, server→client, bidirectional
 - Half-close and reset: `EndOfStream` and `STREAM_RESET`
 - Heartbeats: `PING`/`PONG`
 - Optional client reconnection with exponential backoff; connection generations prevent split writes across reconnects
 
 ## Limitations & caveats
-- Only gob-encodable exported types/fields are supported; consider `gob.Register` for concrete types
-- Stream flow control is not enforced; back pressure relies on channel buffering and application logic
-- No context propagation or per-RPC deadlines beyond simple timeouts inside the codec
-- Protocol, APIs and behavior may change as the design evolves
+- Gob-encodable exported types only; use `gob.Register` for concrete types
+- No enforced stream flow control; rely on channel buffering and application logic
+- No context propagation or per-RPC deadlines (only simple timeouts in the codec)
+- Behavior/APIs may change during iteration
 
 ## Risks (experimental)
-- API and wire format churn: breaking changes can happen without deprecation during the experiment
-- Backpressure and memory growth: lack of enforced flow control means mis-sized buffers or slow consumers can grow memory
-- Blocking user code: if application code stops draining channels, goroutines can leak and streams can deadlock
-- Reconnection semantics: in-flight requests during disconnects may surface as TIMEOUT/connection-lost; design for idempotency
-- Security: no TLS/mTLS/auth; do not send sensitive data over untrusted links
-- Performance trade-offs: gob reflection overhead; a single decoder goroutine per connection can create head-of-line effects for very large frames
-- Operability: no built-in observability/interceptors/metrics; limited ecosystem around net/rpc compared to modern stacks
+- API/wire format churn during experimentation
+- Potential memory growth without flow control (mis-sized buffers or slow consumers)
+- Goroutine leaks/deadlocks if channels are not drained
+- Disconnects may surface as TIMEOUT/connection-lost; prefer idempotent operations
+- Head-of-line blocking for very large frames due to a single decoder goroutine
 
 ## Install
 ```bash
@@ -62,9 +57,7 @@ import (
 
 type Args struct{ A, B int }
 
-type Item struct{ X int }
 
-type Ack struct{ OK bool }
 
 type Filter struct{ N int }
 
@@ -76,13 +69,13 @@ type Out struct{ V int }
 
 type Svc struct{}
 
-// Unary example
+// Add adds two integers.
 func (s *Svc) Add(args *Args, reply *int) error {
 	*reply = args.A + args.B
 	return nil
 }
 
-// Server->Client streaming (reply *chan)
+// Watch streams events to the client (reply *chan).
 func (s *Svc) Watch(args *Filter, reply *chan Event) error {
 	ch := make(chan Event, 16)
 	*reply = ch
@@ -95,7 +88,7 @@ func (s *Svc) Watch(args *Filter, reply *chan Event) error {
 	return nil
 }
 
-// Bidirectional streaming (args chan, reply *chan)
+// Pipe performs bidirectional streaming (args chan, reply *chan).
 func (s *Svc) Pipe(args chan In, reply *chan Out) error {
 	out := make(chan Out, 16)
 	*reply = out
@@ -144,14 +137,14 @@ func main() {
 	// Dial with reconnection + timeout support
 	cli, err := gorpc.NewClient("go://127.0.0.1:8080?timeout=1s")
 	if err != nil { log.Fatal(err) }
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 
 	// Unary
 	var sum int
 	if err := cli.Call("Svc.Add", &Args{A: 7, B: 8}, &sum); err != nil { log.Fatal(err) }
 	fmt.Println("sum=", sum)
 
-	// Server->Client streaming
+	// server→client streaming
 	var events chan Event
 	if err := cli.Call("Svc.Watch", &Filter{N: 3}, &events); err != nil { log.Fatal(err) }
 	for ev := range events { fmt.Println("event:", ev.X) }
@@ -203,9 +196,17 @@ go vet ./...
 go test -race ./...
 ```
 
-## Design & roadmap
-- Design: see [DESIGN.md](./DESIGN.md)
-- Milestones:
+## Design overview
+
+- Transport: gob-framed frames; each frame is a standalone gob value with self-delimiting boundaries (no length prefix)
+- Codecs: implements net/rpc ClientCodec and ServerCodec; single reader goroutine per side; writers are serialized to preserve ordering
+- Streams via channels: args chan T enables client→server; reply *chan T enables server→client; both together enable bidirectional; closing the origin channel half-closes that direction; errors use STREAM_RESET
+- Timeouts & liveness: optional stream timeout for handshake and idle; TIMEOUT resets clean up resources; heartbeats via PING/PONG
+- Errors & resets: uses STREAM_RESET with ResetCode values such as PROTOCOL_ERROR, TIMEOUT, ENCODE_ERROR, DECODE_ERROR; half-close via EndOfStream; receivers close and clean up
+- Reconnection: client read loop owns dialing; connection generation prevents splitting a single logical request across reconnects
+
+## Roadmap
+### Milestones
   1) gob frames and single reader goroutine
   2) ClientCodec/ServerCodec: channel handling and `STREAM_*` forwarding
   3) Flow control/heartbeats/errors (current: heartbeats and basic errors; flow control reserved)
