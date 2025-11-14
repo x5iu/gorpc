@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/rpc"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -1293,5 +1294,161 @@ func TestClientReconnectsAfterConnectionLoss(t *testing.T) {
 		_ = conn.Close()
 	case <-time.After(time.Second):
 		t.Fatalf("expected second connection")
+	}
+}
+
+// TestServerWithCancelFunc_OnClose tests that the cancel function is called
+// when the server codec is explicitly closed.
+func TestServerWithCancelFunc_OnClose(t *testing.T) {
+	c, s := net.Pipe()
+	defer func() { _ = c.Close() }()
+	defer func() { _ = s.Close() }()
+
+	cancelCalled := make(chan struct{})
+	cancel := func() {
+		close(cancelCalled)
+	}
+
+	codec := NewServerCodec(s, WithCancelFunc(cancel))
+	server := rpc.NewServer()
+	if err := server.Register(&Svc{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Close the codec explicitly
+	_ = codec.Close()
+
+	// Verify cancel was called
+	select {
+	case <-cancelCalled:
+		// Success
+	case <-time.After(time.Second):
+		t.Fatal("cancel function was not called on explicit close")
+	}
+}
+
+// TestClientWithCancelFunc_OnClose tests that the cancel function is called
+// when the client codec is explicitly closed.
+func TestClientWithCancelFunc_OnClose(t *testing.T) {
+	c, s := net.Pipe()
+	defer func() { _ = c.Close() }()
+	defer func() { _ = s.Close() }()
+
+	cancelCalled := make(chan struct{})
+	cancel := func() {
+		close(cancelCalled)
+	}
+
+	codec := NewClientCodec(c, WithClientCancelFunc(cancel))
+
+	// Close the codec explicitly
+	_ = codec.Close()
+
+	// Verify cancel was called
+	select {
+	case <-cancelCalled:
+		// Success
+	case <-time.After(time.Second):
+		t.Fatal("cancel function was not called on explicit close")
+	}
+}
+
+// TestClientWithCancelFunc_OnConnectionLoss tests that the cancel function is
+// called when the client connection is lost (not explicitly closed).
+func TestClientWithCancelFunc_OnConnectionLoss(t *testing.T) {
+	c, s := net.Pipe()
+	defer func() { _ = c.Close() }()
+
+	cancelCalled := make(chan struct{})
+	cancel := func() {
+		close(cancelCalled)
+	}
+
+	codec := NewClientCodec(c, WithClientCancelFunc(cancel))
+	defer func() { _ = codec.Close() }()
+
+	// Start readLoop
+	client := rpc.NewClientWithCodec(codec)
+	defer func() { _ = client.Close() }()
+
+	// Simulate connection loss by closing the server side
+	_ = s.Close()
+
+	// Verify cancel was called within a reasonable time
+	select {
+	case <-cancelCalled:
+		// Success
+	case <-time.After(time.Second):
+		t.Fatal("cancel function was not called on connection loss")
+	}
+}
+
+// TestClientNoGoroutineLeak verifies that client Close() doesn't leak goroutines
+func TestClientNoGoroutineLeak(t *testing.T) {
+	before := runtime.NumGoroutine()
+
+	// Run the reconnect test scenario multiple times
+	for i := 0; i < 5; i++ {
+		addr, conns, stop := newReconnectableServer(t)
+		client, err := NewClient(fmt.Sprintf("go://%s?timeout=1", addr))
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+
+		// First connection
+		_ = <-conns
+
+		// Make a call
+		var reply int
+		_ = client.Call("Svc.Add", &Args{A: 1, B: 2}, &reply)
+
+		// Close client
+		_ = client.Close()
+		stop()
+
+		// Give time for goroutines to exit
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Check for goroutine leaks
+	after := runtime.NumGoroutine()
+	leaked := after - before
+
+	// Allow some tolerance for background goroutines
+	if leaked > 2 {
+		t.Fatalf("goroutine leak detected: before=%d, after=%d, leaked=%d", before, after, leaked)
+	}
+}
+
+// TestServerWithCancelFunc_OnConnectionLoss tests that the cancel function is
+// called when the server connection is lost (not explicitly closed).
+func TestServerWithCancelFunc_OnConnectionLoss(t *testing.T) {
+	c, s := net.Pipe()
+	defer func() { _ = s.Close() }()
+
+	cancelCalled := make(chan struct{})
+	cancel := func() {
+		close(cancelCalled)
+	}
+
+	codec := NewServerCodec(s, WithCancelFunc(cancel))
+	defer func() { _ = codec.Close() }()
+
+	// Start readLoop
+	server := rpc.NewServer()
+	if err := server.Register(&Svc{}); err != nil {
+		t.Fatal(err)
+	}
+	go server.ServeCodec(codec)
+
+	// Simulate connection loss by closing the client side
+	_ = c.Close()
+
+	// Verify cancel was called within a reasonable time
+	select {
+	case <-cancelCalled:
+		// Success
+	case <-time.After(time.Second):
+		t.Fatal("cancel function was not called on connection loss")
 	}
 }

@@ -21,6 +21,7 @@ Status: Experimental
 - Half-close and reset: `EndOfStream` and `STREAM_RESET`
 - Heartbeats: `PING`/`PONG`
 - Optional client reconnection with exponential backoff; connection generations prevent split writes across reconnects
+- Lifecycle callbacks: optional cancel functions for context management and cleanup on connection close
 
 ## Limitations & caveats
 - Gob-encodable exported types only; use `gob.Register` for concrete types
@@ -31,7 +32,7 @@ Status: Experimental
 ## Risks (experimental)
 - API/wire format churn during experimentation
 - Potential memory growth without flow control (mis-sized buffers or slow consumers)
-- Goroutine leaks/deadlocks if channels are not drained
+- Goroutine leaks if channels are not drained (note: codec Close() has timeout protection to prevent indefinite hangs)
 - Disconnects may surface as TIMEOUT/connection-lost; prefer idempotent operations
 - Head-of-line blocking for very large frames due to a single decoder goroutine
 
@@ -162,10 +163,38 @@ func main() {
 - `NewServerCodec(rwc io.ReadWriteCloser, opts ...ServerOption) rpc.ServerCodec`
 - `NewClientCodec(rwc io.ReadWriteCloser, opts ...ClientOption) rpc.ClientCodec`
 - `NewClient(rawURL string) (*rpc.Client, error)`
-- Client options: `WithTimeout(d)`, `WithDialer(dial)`, `WithReconnectBackoff(factory)`
-- Server options: `WithServerTimeout(d)`
+- Client options: `WithTimeout(d)`, `WithDialer(dial)`, `WithReconnectBackoff(factory)`, `WithClientCancelFunc(cancel)`
+- Server options: `WithServerTimeout(d)`, `WithCancelFunc(cancel)`
 
 Timeout query parameter accepts Go durations like `500ms`, `2s`, or integer seconds like `1`.
+
+### Lifecycle callbacks
+Both client and server codecs support cancel function callbacks that are invoked when the codec is closed:
+- **Client**: `WithClientCancelFunc(cancel func())` - called when client codec closes (explicitly via Close() or due to connection loss)
+- **Server**: `WithCancelFunc(cancel func())` - called when server codec closes (explicitly via Close() or due to connection loss)
+
+Common use cases:
+- Cancel context to stop related goroutines
+- Clean up resources associated with the connection
+- Remove connection from a connection pool
+- Trigger reconnection logic or circuit breakers
+
+Example:
+```go
+ctx, cancel := context.WithCancel(context.Background())
+client, err := gorpc.NewClient(
+    "go://localhost:8080",
+    gorpc.WithClientCancelFunc(cancel), // auto-cancel context on close
+)
+if err != nil { log.Fatal(err) }
+defer client.Close()
+
+// Use ctx in goroutines that should stop when connection closes
+go func() {
+    <-ctx.Done()
+    log.Println("Connection closed, cleaning up...")
+}()
+```
 
 ## Protocol overview (gob frames)
 Each frame is a gob-encoded `frame` value:
@@ -204,6 +233,10 @@ go test -race ./...
 - Timeouts & liveness: optional stream timeout for handshake and idle; TIMEOUT resets clean up resources; heartbeats via PING/PONG
 - Errors & resets: uses STREAM_RESET with ResetCode values such as PROTOCOL_ERROR, TIMEOUT, ENCODE_ERROR, DECODE_ERROR; half-close via EndOfStream; receivers close and clean up
 - Reconnection: client read loop owns dialing; connection generation prevents splitting a single logical request across reconnects
+- Robustness improvements:
+  - Connection tracking: readLoop tracks the connection it's currently reading from to ensure Close() can interrupt blocking operations even during reconnection
+  - Close() timeout protection: waits up to 2 seconds for readLoop to exit; if timeout occurs, Close() returns to prevent indefinite hangs
+  - Lifecycle callbacks: optional cancel functions invoked on codec close for context cancellation and resource cleanup
 
 ## Roadmap
 ### Milestones

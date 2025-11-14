@@ -89,12 +89,18 @@ type clientCodec struct {
 	closeOnce   sync.Once
 	closedOnce  sync.Once
 
+	// Track the connection being used by readLoop
+	readingMu  sync.Mutex
+	readingRwc io.ReadWriteCloser
+
 	wg sync.WaitGroup
 
 	// Bumps each time a new connection is established.
 	connGen       uint64
 	curRespSeq    uint64
 	streamTimeout time.Duration
+	onClose       func()
+	onCloseOnce   sync.Once
 }
 
 type serverCodec struct {
@@ -119,6 +125,8 @@ type serverCodec struct {
 
 	lastReqHeader lastSeq
 	streamTimeout time.Duration
+	onClose       func()
+	onCloseOnce   sync.Once
 }
 
 type ClientOption func(*clientCodec)
@@ -143,6 +151,10 @@ func WithReconnectBackoff(factory func() Backoff) ClientOption {
 		c.backoff = nil
 		c.connMu.Unlock()
 	}
+}
+
+func WithClientCancelFunc(cancel func()) ClientOption {
+	return func(c *clientCodec) { c.onClose = cancel }
 }
 
 type Backoff interface {
@@ -183,6 +195,10 @@ type ServerOption func(*serverCodec)
 
 func WithServerTimeout(d time.Duration) ServerOption {
 	return func(s *serverCodec) { s.streamTimeout = d }
+}
+
+func WithCancelFunc(cancel func()) ServerOption {
+	return func(s *serverCodec) { s.onClose = cancel }
 }
 
 func NewClientCodec(rwc io.ReadWriteCloser, opts ...ClientOption) rpc.ClientCodec {
@@ -474,6 +490,17 @@ func parseClientTimeout(s string) (time.Duration, error) {
 	return time.Duration(n) * time.Second, nil
 }
 
+func (c *clientCodec) callOnClose() {
+	// Check before calling Do to avoid unnecessary overhead
+	if c.onClose == nil {
+		return
+	}
+	c.onCloseOnce.Do(func() {
+		// Launch in goroutine to avoid blocking readLoop or Close
+		go c.onClose()
+	})
+}
+
 func (c *clientCodec) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
@@ -484,13 +511,46 @@ func (c *clientCodec) Close() error {
 		c.dec = nil
 		c.enc = nil
 		c.connMu.Unlock()
+
+		// Get the connection being used by readLoop
+		c.readingMu.Lock()
+		readingRwc := c.readingRwc
+		c.readingRwc = nil
+		c.readingMu.Unlock()
+
+		// Close the main connection
 		if rwc != nil {
 			err = rwc.Close()
 		}
+
+		// Close the connection being used by readLoop (if different)
+		// This ensures any blocking Decode operation will be interrupted
+		if readingRwc != nil && readingRwc != rwc {
+			_ = readingRwc.Close()
+		}
+
 		c.failPending(errCodecClosed)
+		c.callOnClose()
 	})
 	c.closedOnce.Do(func() { close(c.closed) })
-	c.wg.Wait()
+
+	// Wait for readLoop to exit with timeout
+	// Closing the connection (above) should interrupt any blocking Decode,
+	// so readLoop should exit quickly (typically within milliseconds)
+	done := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// readLoop exited cleanly
+	case <-time.After(2 * time.Second):
+		// This should rarely happen since we closed all connections
+		// If timeout occurs, readLoop goroutine may leak, but Close() won't hang forever
+	}
+
 	c.mu.Lock()
 	for seq, ch := range c.respBody {
 		close(ch)
@@ -510,9 +570,23 @@ func (c *clientCodec) Close() error {
 	return err
 }
 
+func (s *serverCodec) callOnClose() {
+	// Check before calling Do to avoid unnecessary overhead
+	if s.onClose == nil {
+		return
+	}
+	s.onCloseOnce.Do(func() {
+		// Launch in goroutine to avoid blocking readLoop or Close
+		go s.onClose()
+	})
+}
+
 func (s *serverCodec) Close() error {
 	var err error
-	s.closeOnce.Do(func() { err = s.rwc.Close() })
+	s.closeOnce.Do(func() {
+		err = s.rwc.Close()
+		s.callOnClose()
+	})
 	s.closedOnce.Do(func() { close(s.closed) })
 	s.wg.Wait()
 	s.mu.Lock()
@@ -777,6 +851,13 @@ func (c *clientCodec) writeFrameWithGen(f frame, expectGen uint64) error {
 func (c *clientCodec) readLoop() {
 	defer c.wg.Done()
 	defer c.closedOnce.Do(func() { close(c.closed) })
+	defer c.callOnClose()
+	defer func() {
+		// Clean up readingRwc reference on exit
+		c.readingMu.Lock()
+		c.readingRwc = nil
+		c.readingMu.Unlock()
+	}()
 	for {
 		if err := c.ensureConnected(); err != nil {
 			if c.isShutdown() {
@@ -792,10 +873,23 @@ func (c *clientCodec) readLoop() {
 		}
 		c.connMu.Lock()
 		dec := c.dec
+		rwc := c.rwc
 		c.connMu.Unlock()
+
+		// Save the connection being used for reading
+		c.readingMu.Lock()
+		c.readingRwc = rwc
+		c.readingMu.Unlock()
+
 		if dec == nil {
 			continue
 		}
+
+		// Check shutdown before blocking Decode
+		if c.isShutdown() {
+			return
+		}
+
 		var f frame
 		if err := dec.Decode(&f); err != nil {
 			if c.isShutdown() {
@@ -849,6 +943,7 @@ func (c *clientCodec) readLoop() {
 
 func (s *serverCodec) readLoop() {
 	defer s.wg.Done()
+	defer s.callOnClose()
 	for {
 		var f frame
 		if err := s.dec.Decode(&f); err != nil {
