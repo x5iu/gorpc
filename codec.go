@@ -16,6 +16,7 @@ import (
 	"reflect"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -45,6 +46,7 @@ const (
 	streamData         = "STREAM_DATA"
 	streamWindowUpdate = "STREAM_WINDOW_UPDATE" // Reserved (not enforced yet)
 	streamReset        = "STREAM_RESET"
+	streamError        = "STREAM_ERROR" // Transmit errors from iter.Seq2
 	pingType           = "PING"
 	pongType           = "PONG"
 
@@ -76,7 +78,9 @@ type clientCodec struct {
 	backoffFactory func() Backoff
 	shutdown       bool
 
-	respHdrCh   chan frame
+	respHdrCh chan frame
+	// mu protects all shared state accessed by readLoop and other goroutines:
+	// respBody, streams, closed, respHdrSeen, ended, handshake, s2cWanted, pending
 	mu          sync.Mutex
 	respBody    map[uint64]chan frame
 	streams     map[uint64]chan frame
@@ -96,8 +100,10 @@ type clientCodec struct {
 	wg sync.WaitGroup
 
 	// Bumps each time a new connection is established.
-	connGen       uint64
-	curRespSeq    uint64
+	connGen uint64
+	// curRespSeq is used to pass sequence number between ReadResponseHeader and ReadResponseBody.
+	// Use atomic to avoid race when codec is misused with concurrent readers.
+	curRespSeq    atomic.Uint64
 	streamTimeout time.Duration
 	onClose       func()
 	onCloseOnce   sync.Once
@@ -298,6 +304,12 @@ func (c *clientCodec) connect() error {
 			_ = conn.Close()
 			return errCodecClosed
 		}
+		// Check if another goroutine already established a connection
+		if c.rwc != nil {
+			c.connMu.Unlock()
+			_ = conn.Close()
+			return nil
+		}
 		c.rwc = conn
 		c.dec = gob.NewDecoder(conn)
 		c.enc = gob.NewEncoder(conn)
@@ -360,7 +372,12 @@ func (c *clientCodec) trackPending(seq uint64) {
 					select {
 					case c.respHdrCh <- h:
 					default:
-						go func() { c.respHdrCh <- h }()
+						go func() {
+							select {
+							case c.respHdrCh <- h:
+							case <-c.closed:
+							}
+						}()
 					}
 					c.failBody(seq)
 				}
@@ -411,7 +428,12 @@ func (c *clientCodec) failPending(err error) {
 			select {
 			case c.respHdrCh <- h:
 			default:
-				go func(f frame) { c.respHdrCh <- f }(h)
+				go func(f frame) {
+					select {
+					case c.respHdrCh <- f:
+					case <-c.closed:
+					}
+				}(h)
 			}
 		}
 		c.failBody(seq)
@@ -630,13 +652,18 @@ func (c *clientCodec) WriteRequest(r *rpc.Request, body any) error {
 		c.untrackPending(r.Seq)
 		return err
 	}
-	if isChan(body) {
+	if isIterSeq2WithError(body) || isPtrToIterSeq2WithError(body) {
 		f2 := frame{Type: requestBody, Sequence: r.Seq, StreamID: r.Seq, Payload: nil}
 		if err := c.writeFrameWithGen(f2, expectGen); err != nil {
 			c.untrackPending(r.Seq)
 			return err
 		}
-		go c.pumpSendChan(r.Seq, body, dirClientToServer)
+		// If body is a pointer to iter.Seq2, dereference it
+		iterVal := body
+		if isPtrToIterSeq2WithError(body) {
+			iterVal = reflect.ValueOf(body).Elem().Interface()
+		}
+		go c.pumpSendIter(r.Seq, iterVal, dirClientToServer)
 		return nil
 	}
 	b, err := encodeGob(body)
@@ -659,13 +686,13 @@ func (c *clientCodec) ReadResponseHeader(r *rpc.Response) error {
 	r.ServiceMethod = f.ServiceMethod
 	r.Seq = f.Sequence
 	r.Error = f.ErrorMessage
-	c.curRespSeq = f.Sequence
+	c.curRespSeq.Store(f.Sequence)
 	c.markHeaderDelivered(f.Sequence)
 	return nil
 }
 
 func (c *clientCodec) ReadResponseBody(body any) error {
-	seq := c.curRespSeq
+	seq := c.curRespSeq.Load()
 	defer c.clearPending(seq)
 	if body == nil {
 		f := c.waitBody(seq, false)
@@ -680,15 +707,15 @@ func (c *clientCodec) ReadResponseBody(body any) error {
 		c.mu.Unlock()
 		return nil
 	}
-	if isPtrToChan(body) {
-		chv := reflect.ValueOf(body).Elem()
-		ch := reflect.MakeChan(chv.Type(), userChanBuf)
-		chv.Set(ch)
+	if isPtrToIterSeq2WithError(body) {
+		ptrVal := reflect.ValueOf(body).Elem()
+		elemType := getIterSeq2ElemType(ptrVal.Type())
 		c.mu.Lock()
 		c.s2cWanted[seq] = true
 		c.mu.Unlock()
 		sch := c.ensureStream(seq)
-		go c.pumpRecvToChan(seq, ch, sch)
+		iterVal := c.makeRecvIter(seq, elemType, sch)
+		ptrVal.Set(reflect.ValueOf(iterVal))
 		f := c.waitBody(seq, true)
 		if f == nil {
 			return io.EOF
@@ -729,26 +756,15 @@ func (s *serverCodec) ReadRequestBody(body any) error {
 		return nil
 	}
 	seq := s.peekLastHeaderSeq()
-	if isPtrToChan(body) || isChan(body) {
-		var chv reflect.Value
-		if reflect.ValueOf(body).Kind() == reflect.Pointer {
-			chv = reflect.ValueOf(body).Elem()
-		} else {
-			chv = reflect.ValueOf(body)
-		}
-		ch := reflect.MakeChan(chv.Type(), userChanBuf)
-		if chv.CanSet() {
-			chv.Set(ch)
-		} else if reflect.ValueOf(body).Kind() == reflect.Pointer {
-			reflect.ValueOf(body).Elem().Set(ch)
-		} else {
-			return errors.New("gorpc: cannot set chan")
-		}
+	if isPtrToIterSeq2WithError(body) {
+		ptrVal := reflect.ValueOf(body).Elem()
+		elemType := getIterSeq2ElemType(ptrVal.Type())
 		s.mu.Lock()
 		s.c2sWanted[seq] = true
 		s.mu.Unlock()
 		sch := s.ensureStream(seq)
-		go s.pumpRecvToChan(seq, ch, sch)
+		iterVal := s.makeRecvIter(seq, elemType, sch)
+		ptrVal.Set(reflect.ValueOf(iterVal))
 		f := s.waitReqBody(seq)
 		if f == nil {
 			return io.EOF
@@ -771,12 +787,12 @@ func (s *serverCodec) WriteResponse(r *rpc.Response, body any) error {
 	if err := s.writeFrame(f1); err != nil {
 		return err
 	}
-	if isPtrToChan(body) {
+	if isPtrToIterSeq2WithError(body) {
 		f2 := frame{Type: responseBody, Sequence: r.Seq, StreamID: r.Seq, Payload: nil}
 		if err := s.writeFrame(f2); err != nil {
 			return err
 		}
-		go s.pumpSendChan(r.Seq, reflect.ValueOf(body).Elem().Interface(), dirServerToClient)
+		go s.pumpSendIter(r.Seq, reflect.ValueOf(body).Elem().Interface(), dirServerToClient)
 		return nil
 	}
 	b, err := encodeGob(body)
@@ -907,28 +923,37 @@ func (c *clientCodec) readLoop() {
 		}
 		switch f.Type {
 		case responseHeader:
-			if c.respHdrSeen[f.Sequence] {
+			c.mu.Lock()
+			seen := c.respHdrSeen[f.Sequence]
+			if seen {
+				c.mu.Unlock()
 				_ = c.writeFrame(frame{Type: streamReset, Sequence: f.Sequence, StreamID: f.StreamID, Direction: dirClientToServer, ResetCode: "PROTOCOL_ERROR", ErrorMessage: "duplicate header"})
 				break
 			}
 			c.respHdrSeen[f.Sequence] = true
+			c.mu.Unlock()
 			c.respHdrCh <- f
 		case responseBody:
-			if !c.respHdrSeen[f.Sequence] {
+			c.mu.Lock()
+			seen := c.respHdrSeen[f.Sequence]
+			if !seen {
+				c.mu.Unlock()
 				_ = c.writeFrame(frame{Type: streamReset, Sequence: f.Sequence, StreamID: f.StreamID, Direction: dirClientToServer, ResetCode: "PROTOCOL_ERROR", ErrorMessage: "body before header"})
 				break
 			}
 			delete(c.respHdrSeen, f.Sequence)
-			c.mu.Lock()
 			c.handshake[f.Sequence] = true
 			c.mu.Unlock()
 			c.deliverBody(f.Sequence, f)
-		case streamData, streamWindowUpdate, streamReset:
+		case streamData, streamWindowUpdate, streamReset, streamError:
 			if f.Direction != dirServerToClient {
 				_ = c.writeFrame(frame{Type: streamReset, Sequence: f.Sequence, StreamID: f.StreamID, Direction: dirClientToServer, ResetCode: "PROTOCOL_ERROR", ErrorMessage: "invalid direction"})
 				break
 			}
-			if c.respHdrSeen[f.Sequence] {
+			c.mu.Lock()
+			seen := c.respHdrSeen[f.Sequence]
+			c.mu.Unlock()
+			if seen {
 				_ = c.writeFrame(frame{Type: streamReset, Sequence: f.Sequence, StreamID: f.StreamID, Direction: dirClientToServer, ResetCode: "PROTOCOL_ERROR", ErrorMessage: "expected body after header"})
 				break
 			}
@@ -955,28 +980,37 @@ func (s *serverCodec) readLoop() {
 		}
 		switch f.Type {
 		case requestHeader:
-			if s.reqHdrSeen[f.Sequence] {
+			s.mu.Lock()
+			seen := s.reqHdrSeen[f.Sequence]
+			if seen {
+				s.mu.Unlock()
 				_ = s.writeFrame(frame{Type: streamReset, Sequence: f.Sequence, StreamID: f.StreamID, Direction: dirServerToClient, ResetCode: "PROTOCOL_ERROR", ErrorMessage: "duplicate header"})
 				break
 			}
 			s.reqHdrSeen[f.Sequence] = true
+			s.mu.Unlock()
 			s.reqHdrCh <- f
 		case requestBody:
-			if !s.reqHdrSeen[f.Sequence] {
+			s.mu.Lock()
+			seen := s.reqHdrSeen[f.Sequence]
+			if !seen {
+				s.mu.Unlock()
 				_ = s.writeFrame(frame{Type: streamReset, Sequence: f.Sequence, StreamID: f.StreamID, Direction: dirServerToClient, ResetCode: "PROTOCOL_ERROR", ErrorMessage: "body before header"})
 				break
 			}
 			delete(s.reqHdrSeen, f.Sequence)
-			s.mu.Lock()
 			s.handshake[f.Sequence] = true
 			s.mu.Unlock()
 			s.deliverReqBody(f.Sequence, f)
-		case streamData, streamWindowUpdate, streamReset:
+		case streamData, streamWindowUpdate, streamReset, streamError:
 			if f.Direction != dirClientToServer {
 				_ = s.writeFrame(frame{Type: streamReset, Sequence: f.Sequence, StreamID: f.StreamID, Direction: dirServerToClient, ResetCode: "PROTOCOL_ERROR", ErrorMessage: "invalid direction"})
 				break
 			}
-			if s.reqHdrSeen[f.Sequence] {
+			s.mu.Lock()
+			seen := s.reqHdrSeen[f.Sequence]
+			s.mu.Unlock()
+			if seen {
 				_ = s.writeFrame(frame{Type: streamReset, Sequence: f.Sequence, StreamID: f.StreamID, Direction: dirServerToClient, ResetCode: "PROTOCOL_ERROR", ErrorMessage: "expected body after header"})
 				break
 			}
@@ -1057,6 +1091,34 @@ func (c *clientCodec) deliverStream(seq uint64, f frame) {
 	ch := c.streams[seq]
 	c.mu.Unlock()
 
+	// streamError is a terminal frame that needs to be delivered to the receiver
+	// so it can propagate the error to the iterator, then close
+	if f.Type == streamError {
+		if ch == nil {
+			c.mu.Lock()
+			if !c.ended[seq] {
+				ch = make(chan frame, bufStream)
+				c.streams[seq] = ch
+			}
+			c.mu.Unlock()
+		}
+		if ch != nil {
+			ch <- f
+		}
+		c.mu.Lock()
+		if !c.ended[seq] {
+			c.ended[seq] = true
+			if ch2, ok := c.streams[seq]; ok && ch2 != nil {
+				close(ch2)
+			}
+			delete(c.streams, seq)
+			delete(c.handshake, seq)
+			delete(c.s2cWanted, seq)
+		}
+		c.mu.Unlock()
+		return
+	}
+
 	if f.Type == streamReset || (f.Type == streamData && f.EndOfStream) {
 		c.mu.Lock()
 		if !c.ended[seq] {
@@ -1105,6 +1167,34 @@ func (s *serverCodec) deliverStream(seq uint64, f frame) {
 	wanted := s.c2sWanted[seq]
 	ch := s.streams[seq]
 	s.mu.Unlock()
+
+	// streamError is a terminal frame that needs to be delivered to the receiver
+	// so it can propagate the error to the iterator, then close
+	if f.Type == streamError {
+		if ch == nil {
+			s.mu.Lock()
+			if !s.ended[seq] {
+				ch = make(chan frame, bufStream)
+				s.streams[seq] = ch
+			}
+			s.mu.Unlock()
+		}
+		if ch != nil {
+			ch <- f
+		}
+		s.mu.Lock()
+		if !s.ended[seq] {
+			s.ended[seq] = true
+			if ch2, ok := s.streams[seq]; ok && ch2 != nil {
+				close(ch2)
+			}
+			delete(s.streams, seq)
+			delete(s.handshake, seq)
+			delete(s.c2sWanted, seq)
+		}
+		s.mu.Unlock()
+		return
+	}
 
 	if f.Type == streamReset || (f.Type == streamData && f.EndOfStream) {
 		s.mu.Lock()
@@ -1212,7 +1302,10 @@ func (c *clientCodec) waitBody(seq uint64, expectStream bool) *frame {
 	case <-c.closed:
 		return nil
 	case <-t.C:
-		_ = c.writeFrame(frame{Type: streamReset, Sequence: seq, StreamID: seq, Direction: dirClientToServer, ResetCode: "TIMEOUT", ErrorMessage: "handshake timeout"})
+		// Send RESET asynchronously to avoid deadlock with net.Pipe
+		go func() {
+			_ = c.writeFrame(frame{Type: streamReset, Sequence: seq, StreamID: seq, Direction: dirClientToServer, ResetCode: "TIMEOUT", ErrorMessage: "handshake timeout"})
+		}()
 		c.mu.Lock()
 		c.ended[seq] = true
 		if ch2, ok := c.streams[seq]; ok && ch2 != nil {
@@ -1265,7 +1358,10 @@ func (s *serverCodec) waitReqBody(seq uint64) *frame {
 	case <-s.closed:
 		return nil
 	case <-t.C:
-		_ = s.writeFrame(frame{Type: streamReset, Sequence: seq, StreamID: seq, Direction: dirServerToClient, ResetCode: "TIMEOUT", ErrorMessage: "handshake timeout"})
+		// Send RESET asynchronously to avoid deadlock with net.Pipe
+		go func() {
+			_ = s.writeFrame(frame{Type: streamReset, Sequence: seq, StreamID: seq, Direction: dirServerToClient, ResetCode: "TIMEOUT", ErrorMessage: "handshake timeout"})
+		}()
 		s.mu.Lock()
 		s.ended[seq] = true
 		if ch2, ok := s.streams[seq]; ok && ch2 != nil {
@@ -1280,256 +1376,340 @@ func (s *serverCodec) waitReqBody(seq uint64) *frame {
 	}
 }
 
-func (c *clientCodec) pumpSendChan(seq uint64, ch any, dir string) {
-	v := reflect.ValueOf(ch)
-	if !v.IsValid() || v.Kind() != reflect.Chan || v.IsNil() {
+func (c *clientCodec) pumpSendIter(seq uint64, iterVal any, dir string) {
+	v := reflect.ValueOf(iterVal)
+	if !v.IsValid() || v.IsNil() {
 		_ = c.writeFrame(frame{Type: streamData, Sequence: seq, StreamID: seq, Direction: dir, EndOfStream: true})
 		return
 	}
-	closed := reflect.ValueOf(c.closed)
-	cases := []reflect.SelectCase{
-		{Dir: reflect.SelectRecv, Chan: v},
-		{Dir: reflect.SelectRecv, Chan: closed},
-	}
-	for {
-		idx, x, ok := reflect.Select(cases)
-		if idx == 1 {
-			return
+
+	yieldType := v.Type().In(0)
+	yieldFn := reflect.MakeFunc(yieldType, func(args []reflect.Value) []reflect.Value {
+		elem := args[0]
+		errVal := args[1]
+
+		select {
+		case <-c.closed:
+			return []reflect.Value{reflect.ValueOf(false)}
+		default:
 		}
-		if !ok {
-			if err := c.writeFrame(frame{Type: streamData, Sequence: seq, StreamID: seq, Direction: dir, EndOfStream: true}); err != nil {
-				drainChannel(v, c.closed)
-				return
-			}
-			return
+
+		if !errVal.IsNil() {
+			err := errVal.Interface().(error)
+			_ = c.writeFrame(frame{
+				Type: streamError, Sequence: seq, StreamID: seq,
+				Direction: dir, ErrorMessage: err.Error(),
+			})
+			return []reflect.Value{reflect.ValueOf(false)}
 		}
-		b, err := encodeGob(x.Interface())
+
+		b, err := encodeGob(elem.Interface())
 		if err != nil {
-			_ = c.writeFrame(frame{Type: streamReset, Sequence: seq, StreamID: seq, Direction: dir, ResetCode: "ENCODE_ERROR", ErrorMessage: err.Error()})
-			drainChannel(v, c.closed)
-			return
+			_ = c.writeFrame(frame{
+				Type: streamReset, Sequence: seq, StreamID: seq,
+				Direction: dir, ResetCode: "ENCODE_ERROR", ErrorMessage: err.Error(),
+			})
+			return []reflect.Value{reflect.ValueOf(false)}
 		}
-		if err := c.writeFrame(frame{Type: streamData, Sequence: seq, StreamID: seq, Direction: dir, Payload: b}); err != nil {
-			drainChannel(v, c.closed)
-			return
+
+		if err := c.writeFrame(frame{
+			Type: streamData, Sequence: seq, StreamID: seq,
+			Direction: dir, Payload: b,
+		}); err != nil {
+			return []reflect.Value{reflect.ValueOf(false)}
 		}
-	}
+		return []reflect.Value{reflect.ValueOf(true)}
+	})
+
+	v.Call([]reflect.Value{yieldFn})
+	_ = c.writeFrame(frame{Type: streamData, Sequence: seq, StreamID: seq, Direction: dir, EndOfStream: true})
 }
 
-func (s *serverCodec) pumpSendChan(seq uint64, ch any, dir string) {
-	v := reflect.ValueOf(ch)
-	if !v.IsValid() || v.Kind() != reflect.Chan || v.IsNil() {
+func (s *serverCodec) pumpSendIter(seq uint64, iterVal any, dir string) {
+	v := reflect.ValueOf(iterVal)
+	if !v.IsValid() || v.IsNil() {
 		_ = s.writeFrame(frame{Type: streamData, Sequence: seq, StreamID: seq, Direction: dir, EndOfStream: true})
 		return
 	}
-	closed := reflect.ValueOf(s.closed)
-	cases := []reflect.SelectCase{
-		{Dir: reflect.SelectRecv, Chan: v},
-		{Dir: reflect.SelectRecv, Chan: closed},
-	}
-	for {
-		idx, x, ok := reflect.Select(cases)
-		if idx == 1 {
-			return
+
+	yieldType := v.Type().In(0)
+	yieldFn := reflect.MakeFunc(yieldType, func(args []reflect.Value) []reflect.Value {
+		elem := args[0]
+		errVal := args[1]
+
+		select {
+		case <-s.closed:
+			return []reflect.Value{reflect.ValueOf(false)}
+		default:
 		}
-		if !ok {
-			if err := s.writeFrame(frame{Type: streamData, Sequence: seq, StreamID: seq, Direction: dir, EndOfStream: true}); err != nil {
-				drainChannel(v, s.closed)
-				return
-			}
-			return
+
+		if !errVal.IsNil() {
+			err := errVal.Interface().(error)
+			_ = s.writeFrame(frame{
+				Type: streamError, Sequence: seq, StreamID: seq,
+				Direction: dir, ErrorMessage: err.Error(),
+			})
+			return []reflect.Value{reflect.ValueOf(false)}
 		}
-		b, err := encodeGob(x.Interface())
+
+		b, err := encodeGob(elem.Interface())
 		if err != nil {
-			_ = s.writeFrame(frame{Type: streamReset, Sequence: seq, StreamID: seq, Direction: dir, ResetCode: "ENCODE_ERROR", ErrorMessage: err.Error()})
-			drainChannel(v, s.closed)
-			return
+			_ = s.writeFrame(frame{
+				Type: streamReset, Sequence: seq, StreamID: seq,
+				Direction: dir, ResetCode: "ENCODE_ERROR", ErrorMessage: err.Error(),
+			})
+			return []reflect.Value{reflect.ValueOf(false)}
 		}
-		if err := s.writeFrame(frame{Type: streamData, Sequence: seq, StreamID: seq, Direction: dir, Payload: b}); err != nil {
-			drainChannel(v, s.closed)
-			return
+
+		if err := s.writeFrame(frame{
+			Type: streamData, Sequence: seq, StreamID: seq,
+			Direction: dir, Payload: b,
+		}); err != nil {
+			return []reflect.Value{reflect.ValueOf(false)}
 		}
-	}
+		return []reflect.Value{reflect.ValueOf(true)}
+	})
+
+	v.Call([]reflect.Value{yieldFn})
+	_ = s.writeFrame(frame{Type: streamData, Sequence: seq, StreamID: seq, Direction: dir, EndOfStream: true})
 }
 
-func (c *clientCodec) pumpRecvToChan(seq uint64, ch reflect.Value, sch <-chan frame) {
-	elem := ch.Type().Elem()
-	var t *time.Timer
-	if c.streamTimeout > 0 {
-		t = time.NewTimer(c.streamTimeout)
-		defer t.Stop()
-	}
-	for {
-		var f frame
-		var ok bool
-		if t != nil {
-			select {
-			case f, ok = <-sch:
-				if !t.Stop() {
-					select {
-					case <-t.C:
-					default:
+func (c *clientCodec) cleanupStream(seq uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.streams, seq)
+	c.ended[seq] = true
+	delete(c.handshake, seq)
+	delete(c.s2cWanted, seq)
+}
+
+func (c *clientCodec) makeRecvIter(seq uint64, elemType reflect.Type, sch <-chan frame) any {
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	yieldType := reflect.FuncOf([]reflect.Type{elemType, errorType}, []reflect.Type{reflect.TypeOf(true)}, false)
+	iterType := reflect.FuncOf([]reflect.Type{yieldType}, nil, false)
+
+	iterFn := reflect.MakeFunc(iterType, func(args []reflect.Value) []reflect.Value {
+		yield := args[0]
+
+		var t *time.Timer
+		if c.streamTimeout > 0 {
+			t = time.NewTimer(c.streamTimeout)
+			defer t.Stop()
+		}
+
+		for {
+			var f frame
+			var ok bool
+
+			if t != nil {
+				select {
+				case f, ok = <-sch:
+					if !t.Stop() {
+						select {
+						case <-t.C:
+						default:
+						}
 					}
+					t.Reset(c.streamTimeout)
+				case <-t.C:
+					// Send RESET asynchronously to avoid deadlock with net.Pipe
+					go func() {
+						_ = c.writeFrame(frame{Type: streamReset, Sequence: seq, StreamID: seq,
+							Direction: dirClientToServer, ResetCode: "TIMEOUT", ErrorMessage: "stream inactivity"})
+					}()
+					c.cleanupStream(seq)
+					zero := reflect.Zero(elemType)
+					errVal := reflect.ValueOf(errors.New("stream timeout"))
+					yield.Call([]reflect.Value{zero, errVal})
+					return nil
 				}
-				t.Reset(c.streamTimeout)
-			case <-t.C:
-				_ = c.writeFrame(frame{Type: streamReset, Sequence: seq, StreamID: seq, Direction: dirClientToServer, ResetCode: "TIMEOUT", ErrorMessage: "stream inactivity"})
-				c.mu.Lock()
-				delete(c.streams, seq)
-				c.ended[seq] = true
-				delete(c.handshake, seq)
-				delete(c.s2cWanted, seq)
-				c.mu.Unlock()
-				closeChannel(ch)
-				return
+			} else {
+				f, ok = <-sch
 			}
-		} else {
-			f, ok = <-sch
-		}
 
-		if !ok {
-			c.mu.Lock()
-			delete(c.streams, seq)
-			c.ended[seq] = true
-			delete(c.handshake, seq)
-			delete(c.s2cWanted, seq)
-			c.mu.Unlock()
-			closeChannel(ch)
-			return
-		}
-		if f.Type == streamData {
-			if f.EndOfStream {
-				c.mu.Lock()
-				delete(c.streams, seq)
-				c.ended[seq] = true
-				delete(c.handshake, seq)
-				delete(c.s2cWanted, seq)
-				c.mu.Unlock()
-				closeChannel(ch)
-				return
+			if !ok {
+				c.cleanupStream(seq)
+				return nil
 			}
-			v := reflect.New(elem)
-			if err := decodeGob(f.Payload, v.Interface()); err != nil {
-				_ = c.writeFrame(frame{Type: streamReset, Sequence: seq, StreamID: seq, Direction: dirClientToServer, ResetCode: "DECODE_ERROR", ErrorMessage: err.Error()})
-				c.mu.Lock()
-				delete(c.streams, seq)
-				c.ended[seq] = true
-				delete(c.handshake, seq)
-				delete(c.s2cWanted, seq)
-				c.mu.Unlock()
-				closeChannel(ch)
-				return
+
+			switch f.Type {
+			case streamData:
+				if f.EndOfStream {
+					c.cleanupStream(seq)
+					return nil
+				}
+				v := reflect.New(elemType)
+				if err := decodeGob(f.Payload, v.Interface()); err != nil {
+					// Send RESET asynchronously to avoid deadlock with net.Pipe
+					go func(errMsg string) {
+						_ = c.writeFrame(frame{Type: streamReset, Sequence: seq, StreamID: seq,
+							Direction: dirClientToServer, ResetCode: "DECODE_ERROR", ErrorMessage: errMsg})
+					}(err.Error())
+					c.cleanupStream(seq)
+					errVal := reflect.ValueOf(err)
+					yield.Call([]reflect.Value{reflect.Zero(elemType), errVal})
+					return nil
+				}
+				result := yield.Call([]reflect.Value{v.Elem(), reflect.Zero(errorType)})
+				if !result[0].Bool() {
+					c.cleanupStream(seq)
+					return nil
+				}
+			case streamError:
+				c.cleanupStream(seq)
+				errVal := reflect.ValueOf(errors.New(f.ErrorMessage))
+				yield.Call([]reflect.Value{reflect.Zero(elemType), errVal})
+				return nil
+			case streamReset:
+				c.cleanupStream(seq)
+				errVal := reflect.ValueOf(fmt.Errorf("stream reset: %s", f.ResetCode))
+				yield.Call([]reflect.Value{reflect.Zero(elemType), errVal})
+				return nil
 			}
-			ch.Send(v.Elem())
-		} else if f.Type == streamReset {
-			c.mu.Lock()
-			delete(c.streams, seq)
-			c.ended[seq] = true
-			delete(c.handshake, seq)
-			delete(c.s2cWanted, seq)
-			c.mu.Unlock()
-			closeChannel(ch)
-			return
 		}
-	}
+	})
+
+	return iterFn.Interface()
 }
 
-func (s *serverCodec) pumpRecvToChan(seq uint64, ch reflect.Value, sch <-chan frame) {
-	elem := ch.Type().Elem()
-	var t *time.Timer
-	if s.streamTimeout > 0 {
-		t = time.NewTimer(s.streamTimeout)
-		defer t.Stop()
-	}
-	for {
-		var f frame
-		var ok bool
-		if t != nil {
-			select {
-			case f, ok = <-sch:
-				if !t.Stop() {
-					select {
-					case <-t.C:
-					default:
+func (s *serverCodec) cleanupStream(seq uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.streams, seq)
+	s.ended[seq] = true
+	delete(s.handshake, seq)
+	delete(s.c2sWanted, seq)
+}
+
+func (s *serverCodec) makeRecvIter(seq uint64, elemType reflect.Type, sch <-chan frame) any {
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	yieldType := reflect.FuncOf([]reflect.Type{elemType, errorType}, []reflect.Type{reflect.TypeOf(true)}, false)
+	iterType := reflect.FuncOf([]reflect.Type{yieldType}, nil, false)
+
+	iterFn := reflect.MakeFunc(iterType, func(args []reflect.Value) []reflect.Value {
+		yield := args[0]
+
+		var t *time.Timer
+		if s.streamTimeout > 0 {
+			t = time.NewTimer(s.streamTimeout)
+			defer t.Stop()
+		}
+
+		for {
+			var f frame
+			var ok bool
+
+			if t != nil {
+				select {
+				case f, ok = <-sch:
+					if !t.Stop() {
+						select {
+						case <-t.C:
+						default:
+						}
 					}
+					t.Reset(s.streamTimeout)
+				case <-t.C:
+					// Send RESET asynchronously to avoid deadlock with net.Pipe
+					go func() {
+						_ = s.writeFrame(frame{Type: streamReset, Sequence: seq, StreamID: seq,
+							Direction: dirServerToClient, ResetCode: "TIMEOUT", ErrorMessage: "stream inactivity"})
+					}()
+					s.cleanupStream(seq)
+					zero := reflect.Zero(elemType)
+					errVal := reflect.ValueOf(errors.New("stream timeout"))
+					yield.Call([]reflect.Value{zero, errVal})
+					return nil
 				}
-				t.Reset(s.streamTimeout)
-			case <-t.C:
-				_ = s.writeFrame(frame{Type: streamReset, Sequence: seq, StreamID: seq, Direction: dirServerToClient, ResetCode: "TIMEOUT", ErrorMessage: "stream inactivity"})
-				s.mu.Lock()
-				delete(s.streams, seq)
-				s.ended[seq] = true
-				delete(s.handshake, seq)
-				delete(s.c2sWanted, seq)
-				s.mu.Unlock()
-				closeChannel(ch)
-				return
+			} else {
+				f, ok = <-sch
 			}
-		} else {
-			f, ok = <-sch
-		}
 
-		if !ok {
-			s.mu.Lock()
-			delete(s.streams, seq)
-			s.ended[seq] = true
-			delete(s.handshake, seq)
-			delete(s.c2sWanted, seq)
-			s.mu.Unlock()
-			closeChannel(ch)
-			return
-		}
-		if f.Type == streamData {
-			if f.EndOfStream {
-				s.mu.Lock()
-				delete(s.streams, seq)
-				s.ended[seq] = true
-				delete(s.handshake, seq)
-				delete(s.c2sWanted, seq)
-				s.mu.Unlock()
-				closeChannel(ch)
-				return
+			if !ok {
+				s.cleanupStream(seq)
+				return nil
 			}
-			v := reflect.New(elem)
-			if err := decodeGob(f.Payload, v.Interface()); err != nil {
-				_ = s.writeFrame(frame{Type: streamReset, Sequence: seq, StreamID: seq, Direction: dirServerToClient, ResetCode: "DECODE_ERROR", ErrorMessage: err.Error()})
-				s.mu.Lock()
-				delete(s.streams, seq)
-				s.ended[seq] = true
-				delete(s.handshake, seq)
-				delete(s.c2sWanted, seq)
-				s.mu.Unlock()
-				closeChannel(ch)
-				return
+
+			switch f.Type {
+			case streamData:
+				if f.EndOfStream {
+					s.cleanupStream(seq)
+					return nil
+				}
+				v := reflect.New(elemType)
+				if err := decodeGob(f.Payload, v.Interface()); err != nil {
+					// Send RESET asynchronously to avoid deadlock with net.Pipe
+					go func(errMsg string) {
+						_ = s.writeFrame(frame{Type: streamReset, Sequence: seq, StreamID: seq,
+							Direction: dirServerToClient, ResetCode: "DECODE_ERROR", ErrorMessage: errMsg})
+					}(err.Error())
+					s.cleanupStream(seq)
+					errVal := reflect.ValueOf(err)
+					yield.Call([]reflect.Value{reflect.Zero(elemType), errVal})
+					return nil
+				}
+				result := yield.Call([]reflect.Value{v.Elem(), reflect.Zero(errorType)})
+				if !result[0].Bool() {
+					s.cleanupStream(seq)
+					return nil
+				}
+			case streamError:
+				s.cleanupStream(seq)
+				errVal := reflect.ValueOf(errors.New(f.ErrorMessage))
+				yield.Call([]reflect.Value{reflect.Zero(elemType), errVal})
+				return nil
+			case streamReset:
+				s.cleanupStream(seq)
+				errVal := reflect.ValueOf(fmt.Errorf("stream reset: %s", f.ResetCode))
+				yield.Call([]reflect.Value{reflect.Zero(elemType), errVal})
+				return nil
 			}
-			ch.Send(v.Elem())
-		} else if f.Type == streamReset {
-			s.mu.Lock()
-			delete(s.streams, seq)
-			s.ended[seq] = true
-			delete(s.handshake, seq)
-			delete(s.c2sWanted, seq)
-			s.mu.Unlock()
-			closeChannel(ch)
-			return
 		}
-	}
+	})
+
+	return iterFn.Interface()
 }
 
-func isChan(v any) bool {
+// isIterSeq2WithError checks if v is of type iter.Seq2[T, error]
+// iter.Seq2[T, error] signature: func(yield func(T, error) bool)
+func isIterSeq2WithError(v any) bool {
+	if v == nil {
+		return false
+	}
+	return isIterSeq2WithErrorType(reflect.TypeOf(v))
+}
+
+func isIterSeq2WithErrorType(t reflect.Type) bool {
+	if t.Kind() != reflect.Func {
+		return false
+	}
+	if t.NumIn() != 1 || t.NumOut() != 0 {
+		return false
+	}
+	yieldType := t.In(0)
+	if yieldType.Kind() != reflect.Func {
+		return false
+	}
+	if yieldType.NumIn() != 2 || yieldType.NumOut() != 1 {
+		return false
+	}
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	if !yieldType.In(1).Implements(errorType) {
+		return false
+	}
+	return yieldType.Out(0).Kind() == reflect.Bool
+}
+
+func isPtrToIterSeq2WithError(v any) bool {
 	if v == nil {
 		return false
 	}
 	t := reflect.TypeOf(v)
-	return t.Kind() == reflect.Chan
+	return t.Kind() == reflect.Pointer && isIterSeq2WithErrorType(t.Elem())
 }
 
-func isPtrToChan(v any) bool {
-	if v == nil {
-		return false
-	}
-	t := reflect.TypeOf(v)
-	return t.Kind() == reflect.Pointer && t.Elem().Kind() == reflect.Chan
+func getIterSeq2ElemType(t reflect.Type) reflect.Type {
+	return t.In(0).In(0) // func(func(T, error) bool) -> T
 }
 
 func (s *serverCodec) peekLastHeaderSeq() uint64 { return s.lastReqHeader.get() }
@@ -1541,31 +1721,6 @@ type lastSeq struct {
 
 func (l *lastSeq) set(x uint64) { l.mu.Lock(); l.v = x; l.mu.Unlock() }
 func (l *lastSeq) get() uint64  { l.mu.Lock(); defer l.mu.Unlock(); return l.v }
-
-func closeChannel(v reflect.Value) {
-	if v.IsValid() {
-		v.Close()
-	}
-}
-
-func drainChannel(v reflect.Value, closed <-chan struct{}) {
-	if !v.IsValid() || v.Kind() != reflect.Chan || v.IsNil() {
-		return
-	}
-	cases := []reflect.SelectCase{{Dir: reflect.SelectRecv, Chan: v}}
-	if closed != nil {
-		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(closed)})
-	}
-	for {
-		idx, _, ok := reflect.Select(cases)
-		if len(cases) == 2 && idx == 1 {
-			return
-		}
-		if !ok {
-			return
-		}
-	}
-}
 
 var bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 var readerPool = sync.Pool{New: func() any { return new(bytes.Reader) }}

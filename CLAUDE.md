@@ -6,7 +6,7 @@ Repository: github.com/x5iu/gorpc
 
 Overview
 - Experimental project layering bidirectional streaming RPC over Go's net/rpc using custom ClientCodec/ServerCodec and a simple gob-framed wire format. See README.md for user-facing docs and protocol details.
-- Key goals: retain net/rpc's concurrency and lifecycle while adding channel-driven streaming (client→server, server→client, bidi) with minimal framing.
+- Key goals: retain net/rpc's concurrency and lifecycle while adding iterator-based streaming (client→server, server→client, bidi) with minimal framing.
 - Built with Claude Code + GPT-5 as an experimental exploration of streaming over net/rpc.
 
 Commands (use these during development)
