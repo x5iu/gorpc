@@ -21,13 +21,13 @@ Status: Experimental
 - Half-close and reset: `EndOfStream` and `STREAM_RESET`
 - Heartbeats: `PING`/`PONG`
 - Optional client reconnection with exponential backoff; connection generations prevent split writes across reconnects
-- Lifecycle callbacks: optional cancel functions for context management and cleanup on connection close
+- Automatic context handling: client codec clears `context.Context` fields before encoding (avoiding gob errors); server codec injects request-scoped contexts into args structs, canceled when RPC completes
 
 ## Limitations & caveats
 - Requires Go 1.23+ for `iter.Seq2` support
 - Gob-encodable exported types only; use `gob.Register` for concrete types
 - No enforced stream flow control; rely on buffering and application logic
-- No context propagation or per-RPC deadlines (only simple timeouts in the codec)
+- Context injection is server-side only; client `context.Context` fields are cleared before sending (gob cannot encode non-nil contexts)
 - Behavior/APIs may change during iteration
 
 ## Risks (experimental)
@@ -189,38 +189,42 @@ func main() {
 - `NewServerCodec(rwc io.ReadWriteCloser, opts ...ServerOption) rpc.ServerCodec`
 - `NewClientCodec(rwc io.ReadWriteCloser, opts ...ClientOption) rpc.ClientCodec`
 - `NewClient(rawURL string) (*rpc.Client, error)`
-- Client options: `WithTimeout(d)`, `WithDialer(dial)`, `WithReconnectBackoff(factory)`, `WithClientCancelFunc(cancel)`
-- Server options: `WithServerTimeout(d)`, `WithCancelFunc(cancel)`
+- Client options: `WithTimeout(d)`, `WithDialer(dial)`, `WithReconnectBackoff(factory)`
+- Server options: `WithServerTimeout(d)`
 
 Timeout query parameter accepts Go durations like `500ms`, `2s`, or integer seconds like `1`.
 
-### Lifecycle callbacks
-Both client and server codecs support cancel function callbacks that are invoked when the codec is closed:
-- **Client**: `WithClientCancelFunc(cancel func())` - called when client codec closes (explicitly via Close() or due to connection loss)
-- **Server**: `WithCancelFunc(cancel func())` - called when server codec closes (explicitly via Close() or due to connection loss)
-
-Common use cases:
-- Cancel context to stop related goroutines
-- Clean up resources associated with the connection
-- Remove connection from a connection pool
-- Trigger reconnection logic or circuit breakers
+### Context injection (server-side)
+The server codec automatically injects a request-scoped `context.Context` into args structs. If your args type has a `context.Context` field (directly or nested), it will be populated with a context that:
+- Is a child of the codec's connection-level context
+- Is canceled when the RPC handler returns (WriteResponse completes)
+- Is canceled if the connection closes
 
 Example:
 ```go
-ctx, cancel := context.WithCancel(context.Background())
-client, err := gorpc.NewClient(
-    "go://localhost:8080",
-    gorpc.WithClientCancelFunc(cancel), // auto-cancel context on close
-)
-if err != nil { log.Fatal(err) }
-defer client.Close()
+// Define args with a context field
+type MyArgs struct {
+    Ctx  context.Context
+    Data int
+}
 
-// Use ctx in goroutines that should stop when connection closes
-go func() {
-    <-ctx.Done()
-    log.Println("Connection closed, cleaning up...")
-}()
+// Server handler - context is automatically injected
+func (s *MySvc) DoWork(args *MyArgs, reply *Result) error {
+    // args.Ctx is valid and will be canceled when this method returns
+    select {
+    case <-args.Ctx.Done():
+        return args.Ctx.Err()
+    case result := <-doExpensiveWork(args.Ctx):
+        *reply = result
+        return nil
+    }
+}
 ```
+
+Common use cases:
+- Pass context to downstream operations (database queries, HTTP calls)
+- Implement request cancellation when connection drops
+- Set request-scoped deadlines and timeouts
 
 ## Protocol overview (gob frames)
 Each frame is a gob-encoded `frame` value:
@@ -263,7 +267,7 @@ go test -race ./...
 - Robustness improvements:
   - Connection tracking: readLoop tracks the connection it's currently reading from to ensure Close() can interrupt blocking operations even during reconnection
   - Close() timeout protection: waits up to 2 seconds for readLoop to exit; if timeout occurs, Close() returns to prevent indefinite hangs
-  - Lifecycle callbacks: optional cancel functions invoked on codec close for context cancellation and resource cleanup
+  - Context management: codec-level context canceled on close; client clears context fields before encoding; server injects per-request child contexts into args, canceled on RPC completion
 
 ## Roadmap
 ### Milestones

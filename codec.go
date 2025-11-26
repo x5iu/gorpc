@@ -6,6 +6,7 @@ package gorpc
 
 import (
 	"bytes"
+	"context"
 	"encoding/gob"
 	"errors"
 	"fmt"
@@ -105,8 +106,10 @@ type clientCodec struct {
 	// Use atomic to avoid race when codec is misused with concurrent readers.
 	curRespSeq    atomic.Uint64
 	streamTimeout time.Duration
-	onClose       func()
-	onCloseOnce   sync.Once
+
+	// Context for connection lifecycle; canceled when codec closes.
+	ctx       context.Context
+	ctxCancel context.CancelFunc
 }
 
 type serverCodec struct {
@@ -131,8 +134,14 @@ type serverCodec struct {
 
 	lastReqHeader lastSeq
 	streamTimeout time.Duration
-	onClose       func()
-	onCloseOnce   sync.Once
+
+	// Context for connection lifecycle; canceled when codec closes.
+	ctx       context.Context
+	ctxCancel context.CancelFunc
+
+	// Per-request context cancel functions, keyed by sequence number.
+	reqCtxMu      sync.Mutex
+	reqCtxCancels map[uint64]context.CancelFunc
 }
 
 type ClientOption func(*clientCodec)
@@ -157,10 +166,6 @@ func WithReconnectBackoff(factory func() Backoff) ClientOption {
 		c.backoff = nil
 		c.connMu.Unlock()
 	}
-}
-
-func WithClientCancelFunc(cancel func()) ClientOption {
-	return func(c *clientCodec) { c.onClose = cancel }
 }
 
 type Backoff interface {
@@ -203,11 +208,8 @@ func WithServerTimeout(d time.Duration) ServerOption {
 	return func(s *serverCodec) { s.streamTimeout = d }
 }
 
-func WithCancelFunc(cancel func()) ServerOption {
-	return func(s *serverCodec) { s.onClose = cancel }
-}
-
 func NewClientCodec(rwc io.ReadWriteCloser, opts ...ClientOption) rpc.ClientCodec {
+	ctx, cancel := context.WithCancel(context.Background())
 	c := &clientCodec{
 		rwc:         rwc,
 		respHdrCh:   make(chan frame, bufHdr),
@@ -222,6 +224,8 @@ func NewClientCodec(rwc io.ReadWriteCloser, opts ...ClientOption) rpc.ClientCode
 		backoffFactory: func() Backoff {
 			return &exponentialBackoff{base: 100 * time.Millisecond, max: 2 * time.Second}
 		},
+		ctx:       ctx,
+		ctxCancel: cancel,
 	}
 	if rwc != nil {
 		c.dec = gob.NewDecoder(rwc)
@@ -241,18 +245,22 @@ func NewClientCodec(rwc io.ReadWriteCloser, opts ...ClientOption) rpc.ClientCode
 }
 
 func NewServerCodec(rwc io.ReadWriteCloser, opts ...ServerOption) rpc.ServerCodec {
+	ctx, cancel := context.WithCancel(context.Background())
 	s := &serverCodec{
-		rwc:        rwc,
-		dec:        gob.NewDecoder(rwc),
-		enc:        gob.NewEncoder(rwc),
-		reqHdrCh:   make(chan frame, bufHdr),
-		reqBody:    make(map[uint64]chan frame),
-		streams:    make(map[uint64]chan frame),
-		closed:     make(chan struct{}),
-		reqHdrSeen: make(map[uint64]bool),
-		ended:      make(map[uint64]bool),
-		handshake:  make(map[uint64]bool),
-		c2sWanted:  make(map[uint64]bool),
+		rwc:           rwc,
+		dec:           gob.NewDecoder(rwc),
+		enc:           gob.NewEncoder(rwc),
+		reqHdrCh:      make(chan frame, bufHdr),
+		reqBody:       make(map[uint64]chan frame),
+		streams:       make(map[uint64]chan frame),
+		closed:        make(chan struct{}),
+		reqHdrSeen:    make(map[uint64]bool),
+		ended:         make(map[uint64]bool),
+		handshake:     make(map[uint64]bool),
+		c2sWanted:     make(map[uint64]bool),
+		ctx:           ctx,
+		ctxCancel:     cancel,
+		reqCtxCancels: make(map[uint64]context.CancelFunc),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -513,14 +521,10 @@ func parseClientTimeout(s string) (time.Duration, error) {
 }
 
 func (c *clientCodec) callOnClose() {
-	// Check before calling Do to avoid unnecessary overhead
-	if c.onClose == nil {
-		return
+	// Cancel the codec-level context, which cascades to all per-request contexts
+	if c.ctxCancel != nil {
+		c.ctxCancel()
 	}
-	c.onCloseOnce.Do(func() {
-		// Launch in goroutine to avoid blocking readLoop or Close
-		go c.onClose()
-	})
 }
 
 func (c *clientCodec) Close() error {
@@ -593,14 +597,10 @@ func (c *clientCodec) Close() error {
 }
 
 func (s *serverCodec) callOnClose() {
-	// Check before calling Do to avoid unnecessary overhead
-	if s.onClose == nil {
-		return
+	// Cancel the codec-level context, which cascades to all per-request contexts
+	if s.ctxCancel != nil {
+		s.ctxCancel()
 	}
-	s.onCloseOnce.Do(func() {
-		// Launch in goroutine to avoid blocking readLoop or Close
-		go s.onClose()
-	})
 }
 
 func (s *serverCodec) Close() error {
@@ -666,6 +666,9 @@ func (c *clientCodec) WriteRequest(r *rpc.Request, body any) error {
 		go c.pumpSendIter(r.Seq, iterVal, dirClientToServer)
 		return nil
 	}
+	// Clear context.Context fields to nil before gob encoding,
+	// since gob cannot encode non-nil context.Context interface values.
+	clearContext(reflect.ValueOf(body))
 	b, err := encodeGob(body)
 	if err != nil {
 		c.untrackPending(r.Seq)
@@ -769,6 +772,9 @@ func (s *serverCodec) ReadRequestBody(body any) error {
 		if f == nil {
 			return io.EOF
 		}
+		// Inject context into the body (args) after handshake
+		cancel := injectContext(reflect.ValueOf(body), s.ctx)
+		s.registerReqCtxCancel(seq, cancel)
 		return nil
 	}
 	f := s.waitReqBody(seq)
@@ -776,6 +782,9 @@ func (s *serverCodec) ReadRequestBody(body any) error {
 		return io.EOF
 	}
 	err := decodeGob(f.Payload, body)
+	// Inject context into the body (args) after decoding
+	cancel := injectContext(reflect.ValueOf(body), s.ctx)
+	s.registerReqCtxCancel(seq, cancel)
 	s.mu.Lock()
 	delete(s.handshake, seq)
 	s.mu.Unlock()
@@ -783,6 +792,7 @@ func (s *serverCodec) ReadRequestBody(body any) error {
 }
 
 func (s *serverCodec) WriteResponse(r *rpc.Response, body any) error {
+	defer s.cancelReqCtx(r.Seq)
 	f1 := frame{Type: responseHeader, Sequence: r.Seq, StreamID: r.Seq, ServiceMethod: r.ServiceMethod, ErrorMessage: r.Error}
 	if err := s.writeFrame(f1); err != nil {
 		return err
@@ -1748,4 +1758,125 @@ func decodeGob(b []byte, out any) error {
 	err := dec.Decode(out)
 	readerPool.Put(r)
 	return err
+}
+
+var contextType = reflect.TypeOf((*context.Context)(nil)).Elem()
+
+// registerReqCtxCancel stores the cancel function for a request.
+func (s *serverCodec) registerReqCtxCancel(seq uint64, cancel context.CancelFunc) {
+	if cancel == nil {
+		return
+	}
+	s.reqCtxMu.Lock()
+	s.reqCtxCancels[seq] = cancel
+	s.reqCtxMu.Unlock()
+}
+
+// cancelReqCtx cancels and removes the context for a request.
+func (s *serverCodec) cancelReqCtx(seq uint64) {
+	s.reqCtxMu.Lock()
+	cancel := s.reqCtxCancels[seq]
+	delete(s.reqCtxCancels, seq)
+	s.reqCtxMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// injectContext recursively sets context.Context fields in the given value
+// using a child context derived from parent. Returns the cancel function
+// that should be called when the request completes.
+// The value v must be settable (typically obtained via reflect.ValueOf(&x).Elem()).
+func injectContext(v reflect.Value, parent context.Context) context.CancelFunc {
+	if !v.IsValid() {
+		return nil
+	}
+
+	// Handle pointer: dereference if non-nil
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return nil
+		}
+		return injectContext(v.Elem(), parent)
+	}
+
+	// Handle interface: if it's context.Context, replace it
+	if v.Kind() == reflect.Interface {
+		if v.Type().Implements(contextType) && v.CanSet() {
+			child, cancel := context.WithCancel(parent)
+			v.Set(reflect.ValueOf(child))
+			return cancel
+		}
+		// If the interface contains a struct, try to inject into it
+		if !v.IsNil() && v.Elem().Kind() == reflect.Struct {
+			return injectContext(v.Elem(), parent)
+		}
+		return nil
+	}
+
+	// Handle struct: recursively check all fields
+	if v.Kind() == reflect.Struct {
+		var cancels []context.CancelFunc
+		for i := 0; i < v.NumField(); i++ {
+			field := v.Field(i)
+			if !field.CanSet() {
+				continue
+			}
+			if cancel := injectContext(field, parent); cancel != nil {
+				cancels = append(cancels, cancel)
+			}
+		}
+		if len(cancels) == 0 {
+			return nil
+		}
+		return func() {
+			for _, c := range cancels {
+				c()
+			}
+		}
+	}
+
+	return nil
+}
+
+// clearContext recursively sets context.Context fields in the given value to nil.
+// This is used on the client side before gob encoding to avoid gob errors,
+// since gob cannot encode non-nil context.Context interface values.
+func clearContext(v reflect.Value) {
+	if !v.IsValid() {
+		return
+	}
+
+	// Handle pointer: dereference if non-nil
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return
+		}
+		clearContext(v.Elem())
+		return
+	}
+
+	// Handle interface: if it's context.Context, set to nil
+	if v.Kind() == reflect.Interface {
+		if v.Type().Implements(contextType) && v.CanSet() {
+			v.Set(reflect.Zero(v.Type()))
+			return
+		}
+		// If the interface contains a struct, try to clear its context fields
+		if !v.IsNil() && v.Elem().Kind() == reflect.Struct {
+			clearContext(v.Elem())
+		}
+		return
+	}
+
+	// Handle struct: recursively check all fields
+	if v.Kind() == reflect.Struct {
+		for i := 0; i < v.NumField(); i++ {
+			field := v.Field(i)
+			if !field.CanSet() {
+				continue
+			}
+			clearContext(field)
+		}
+	}
 }

@@ -43,17 +43,20 @@ High-level architecture
   - Optional streamTimeout governs handshake wait and stream idle; leads to TIMEOUT resets and resource cleanup.
   - Client reconnection with exponential backoff; connection generation prevents split request frames across reconnects.
   - Close() with timeout protection: waits up to 2 seconds for readLoop to exit; closes both main connection and readLoop's active connection to interrupt blocking Decode.
-- Lifecycle callbacks:
-  - Both client and server support cancel function callbacks (WithClientCancelFunc/WithCancelFunc) that are invoked when the codec is closed (explicitly or due to connection loss).
-  - Useful for context cancellation, resource cleanup, and connection pool management.
+- Context lifecycle management:
+  - Both client and server codecs create an internal context.Context that is canceled when the codec closes (explicitly or due to connection loss).
+  - Client codec automatically clears context.Context fields to nil before gob encoding (via clearContext), since gob cannot encode non-nil context.Context interface values.
+  - Server codec automatically injects child contexts into request args: if args contains a context.Context field (directly or nested in a struct), a child context is created and set. This child context is canceled when WriteResponse completes.
+  - Useful for request-scoped cancellation, timeouts, and resource cleanup in RPC handlers.
 - Encoding helpers:
   - encodeGob/decodeGob use small buffer/reader pools. Only exported fields/types are encoded.
 
 Tests as executable spec
-- codec_test.go exercises: unary success/error, stream directions and half-close, protocol violations producing RESET, decode/encode error paths, timeout behavior, default StreamID, duplicate header protection, reconnection path, cancel function callbacks, goroutine leak detection.
+- codec_test.go exercises: unary success/error, stream directions and half-close, protocol violations producing RESET, decode/encode error paths, timeout behavior, default StreamID, duplicate header protection, reconnection path, context injection, goroutine leak detection.
 - Key test patterns:
   - TestClientNoGoroutineLeak: verifies no goroutine leaks after Close() in reconnection scenarios
-  - TestClientWithCancelFunc_* and TestServerWithCancelFunc_*: verify lifecycle callbacks work for both explicit close and connection loss
+  - TestServerContextInjection: verifies context is injected into args and canceled after RPC completes
+  - TestServerContextCanceledOnCodecClose: verifies contexts are canceled when codec closes
   - TestClientReconnectsAfterConnectionLoss: tests client reconnection behavior (note: this test was historically flaky but has been fixed with connection tracking improvements)
 - Use targeted runs when iterating (e.g., go test -run '^TestBidiStream$' -v).
 
@@ -70,7 +73,7 @@ Extension points (where to look/change)
 - Heartbeats: PING/PONG handling in read loops if you need custom liveness.
 - Dialing/security: NewClient uses a dialer hook (WithDialer option); wrap it for TLS or custom transports without changing codecs.
 - Reconnect policy: Backoff interface and exponentialBackoff impl can be swapped via WithReconnectBackoff.
-- Lifecycle hooks: WithClientCancelFunc and WithCancelFunc provide callbacks for connection close events (useful for context cancellation, cleanup, etc).
+- Context handling: injectContext (server) recursively finds and sets context.Context fields; clearContext (client) recursively clears them to nil before encoding.
 
 API surface (Client)
 - NewClient(rawURL string) (*rpc.Client, error) - Creates client with reconnection support; URL format: "go://host:port?timeout=<duration>"
@@ -79,21 +82,21 @@ API surface (Client)
   - WithTimeout(d time.Duration) - Sets stream timeout for handshake and idle detection
   - WithDialer(dial func() (io.ReadWriteCloser, error)) - Custom dialer for reconnection
   - WithReconnectBackoff(factory func() Backoff) - Custom backoff strategy
-  - WithClientCancelFunc(cancel func()) - Callback invoked on codec close (explicit or connection loss)
 
 API surface (Server)
 - NewServerCodec(rwc io.ReadWriteCloser, opts ...ServerOption) rpc.ServerCodec
 - Server options:
   - WithServerTimeout(d time.Duration) - Sets stream timeout
-  - WithCancelFunc(cancel func()) - Callback invoked on codec close (explicit or connection loss)
+- Context injection: If args struct contains a context.Context field, it is automatically populated with a request-scoped context that is canceled when the RPC completes.
 
 Important implementation details
 - Connection tracking fix: clientCodec tracks both the main connection (rwc) and the connection currently being read by readLoop (readingRwc). This prevents Close() from hanging when reconnection happens between acquiring the decoder and blocking on Decode().
 - Close() timeout protection: waits up to 2 seconds for readLoop to exit; if timeout occurs, Close() returns anyway to prevent indefinite hangs.
-- Cancel callbacks run in separate goroutines to avoid blocking Close() or readLoop.
-- sync.Once ensures cancel callbacks run exactly once even if Close() is called multiple times.
+- Context management: Each codec has a connection-level context (ctx/ctxCancel) canceled on close. Server codec also maintains per-request contexts (reqCtxCancels map) that are canceled in WriteResponse.
+- injectContext uses reflection to recursively find context.Context fields in structs and set them with child contexts derived from the codec's connection context.
+- clearContext uses reflection to recursively find context.Context fields and set them to nil before gob encoding (avoiding "gob: type not registered for interface" errors).
 
 Anti-drift tip (finding refs when lines shift)
 - Use ripgrep to locate definitions quickly when line numbers change:
-  - rg -n "type clientCodec|type serverCodec|func NewClient|func NewClientCodec|func NewServerCodec|writeFrameWithGen|readLoop|deliverStream|pumpSendChan|pumpRecvToChan|func With" codec.go
-  - rg -n "TestClientReconnects|TestClientNoGoroutineLeak|TestClientWithCancelFunc|TestServerWithCancelFunc" codec_test.go
+  - rg -n "type clientCodec|type serverCodec|func NewClient|func NewClientCodec|func NewServerCodec|writeFrameWithGen|readLoop|deliverStream|pumpSendIter|injectContext|clearContext|func With" codec.go
+  - rg -n "TestClientReconnects|TestClientNoGoroutineLeak|TestServerContextInjection|TestServerContextCanceled|TestClientClearsContext" codec_test.go
