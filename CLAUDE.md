@@ -79,14 +79,15 @@ API surface (Client)
 - NewClient(rawURL string) (*rpc.Client, error) - Creates client with reconnection support; URL format: "go://host:port?timeout=<duration>"
 - NewClientCodec(rwc io.ReadWriteCloser, opts ...ClientOption) rpc.ClientCodec
 - Client options:
-  - WithTimeout(d time.Duration) - Sets stream timeout for handshake and idle detection
+  - WithTimeout(d time.Duration) - Timeout for waiting response header/body
+  - WithIdleTimeout(d time.Duration) - Timeout for stream inactivity (iter.Seq2 streaming)
   - WithDialer(dial func() (io.ReadWriteCloser, error)) - Custom dialer for reconnection
   - WithReconnectBackoff(factory func() Backoff) - Custom backoff strategy
 
 API surface (Server)
 - NewServerCodec(rwc io.ReadWriteCloser, opts ...ServerOption) rpc.ServerCodec
 - Server options:
-  - WithServerTimeout(d time.Duration) - Sets stream timeout
+  - WithServerIdleTimeout(d time.Duration) - Timeout for stream inactivity (iter.Seq2 streaming)
 - Context injection: If args struct contains a context.Context field, it is automatically populated with a request-scoped context that is canceled when the RPC completes.
 
 Important implementation details

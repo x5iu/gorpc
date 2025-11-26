@@ -66,7 +66,7 @@ func TestRace_ReqHdrSeen_ConcurrentAccess(t *testing.T) {
 			srvConn, cliConn := net.Pipe()
 			defer cliConn.Close()
 
-			srv := NewServerCodec(srvConn, WithServerTimeout(10*time.Millisecond))
+			srv := NewServerCodec(srvConn)
 			defer srv.Close()
 
 			enc := gob.NewEncoder(cliConn)

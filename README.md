@@ -189,8 +189,8 @@ func main() {
 - `NewServerCodec(rwc io.ReadWriteCloser, opts ...ServerOption) rpc.ServerCodec`
 - `NewClientCodec(rwc io.ReadWriteCloser, opts ...ClientOption) rpc.ClientCodec`
 - `NewClient(rawURL string) (*rpc.Client, error)`
-- Client options: `WithTimeout(d)`, `WithDialer(dial)`, `WithReconnectBackoff(factory)`
-- Server options: `WithServerTimeout(d)`
+- Client options: `WithTimeout(d)` (response timeout), `WithIdleTimeout(d)` (stream idle timeout), `WithDialer(dial)`, `WithReconnectBackoff(factory)`
+- Server options: `WithServerIdleTimeout(d)` (stream idle timeout)
 
 Timeout query parameter accepts Go durations like `500ms`, `2s`, or integer seconds like `1`.
 

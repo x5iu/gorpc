@@ -105,7 +105,8 @@ type clientCodec struct {
 	// curRespSeq is used to pass sequence number between ReadResponseHeader and ReadResponseBody.
 	// Use atomic to avoid race when codec is misused with concurrent readers.
 	curRespSeq    atomic.Uint64
-	streamTimeout time.Duration
+	streamTimeout time.Duration // timeout for waiting response header/body
+	idleTimeout   time.Duration // timeout for stream inactivity
 
 	// Context for connection lifecycle; canceled when codec closes.
 	ctx       context.Context
@@ -133,7 +134,7 @@ type serverCodec struct {
 	wg sync.WaitGroup
 
 	lastReqHeader lastSeq
-	streamTimeout time.Duration
+	idleTimeout   time.Duration // timeout for stream inactivity
 
 	// Context for connection lifecycle; canceled when codec closes.
 	ctx       context.Context
@@ -147,6 +148,8 @@ type serverCodec struct {
 type ClientOption func(*clientCodec)
 
 func WithTimeout(d time.Duration) ClientOption { return func(c *clientCodec) { c.streamTimeout = d } }
+
+func WithIdleTimeout(d time.Duration) ClientOption { return func(c *clientCodec) { c.idleTimeout = d } }
 
 func WithDialer(d func() (io.ReadWriteCloser, error)) ClientOption {
 	return func(c *clientCodec) {
@@ -204,8 +207,8 @@ type pendingState struct {
 
 type ServerOption func(*serverCodec)
 
-func WithServerTimeout(d time.Duration) ServerOption {
-	return func(s *serverCodec) { s.streamTimeout = d }
+func WithServerIdleTimeout(d time.Duration) ServerOption {
+	return func(s *serverCodec) { s.idleTimeout = d }
 }
 
 func NewClientCodec(rwc io.ReadWriteCloser, opts ...ClientOption) rpc.ClientCodec {
@@ -1339,23 +1342,6 @@ func (s *serverCodec) waitReqBody(seq uint64) *frame {
 	}
 	s.mu.Unlock()
 
-	if s.streamTimeout <= 0 {
-		select {
-		case f, ok := <-ch:
-			s.mu.Lock()
-			delete(s.reqBody, seq)
-			s.mu.Unlock()
-			if !ok {
-				return nil
-			}
-			return &f
-		case <-s.closed:
-			return nil
-		}
-	}
-
-	t := time.NewTimer(s.streamTimeout)
-	defer t.Stop()
 	select {
 	case f, ok := <-ch:
 		s.mu.Lock()
@@ -1366,22 +1352,6 @@ func (s *serverCodec) waitReqBody(seq uint64) *frame {
 		}
 		return &f
 	case <-s.closed:
-		return nil
-	case <-t.C:
-		// Send RESET asynchronously to avoid deadlock with net.Pipe
-		go func() {
-			_ = s.writeFrame(frame{Type: streamReset, Sequence: seq, StreamID: seq, Direction: dirServerToClient, ResetCode: "TIMEOUT", ErrorMessage: "handshake timeout"})
-		}()
-		s.mu.Lock()
-		s.ended[seq] = true
-		if ch2, ok := s.streams[seq]; ok && ch2 != nil {
-			close(ch2)
-		}
-		delete(s.streams, seq)
-		delete(s.reqBody, seq)
-		delete(s.c2sWanted, seq)
-		delete(s.handshake, seq)
-		s.mu.Unlock()
 		return nil
 	}
 }
@@ -1502,8 +1472,8 @@ func (c *clientCodec) makeRecvIter(seq uint64, elemType reflect.Type, sch <-chan
 		yield := args[0]
 
 		var t *time.Timer
-		if c.streamTimeout > 0 {
-			t = time.NewTimer(c.streamTimeout)
+		if c.idleTimeout > 0 {
+			t = time.NewTimer(c.idleTimeout)
 			defer t.Stop()
 		}
 
@@ -1520,7 +1490,7 @@ func (c *clientCodec) makeRecvIter(seq uint64, elemType reflect.Type, sch <-chan
 						default:
 						}
 					}
-					t.Reset(c.streamTimeout)
+					t.Reset(c.idleTimeout)
 				case <-t.C:
 					// Send RESET asynchronously to avoid deadlock with net.Pipe
 					go func() {
@@ -1600,8 +1570,8 @@ func (s *serverCodec) makeRecvIter(seq uint64, elemType reflect.Type, sch <-chan
 		yield := args[0]
 
 		var t *time.Timer
-		if s.streamTimeout > 0 {
-			t = time.NewTimer(s.streamTimeout)
+		if s.idleTimeout > 0 {
+			t = time.NewTimer(s.idleTimeout)
 			defer t.Stop()
 		}
 
@@ -1618,7 +1588,7 @@ func (s *serverCodec) makeRecvIter(seq uint64, elemType reflect.Type, sch <-chan
 						default:
 						}
 					}
-					t.Reset(s.streamTimeout)
+					t.Reset(s.idleTimeout)
 				case <-t.C:
 					// Send RESET asynchronously to avoid deadlock with net.Pipe
 					go func() {

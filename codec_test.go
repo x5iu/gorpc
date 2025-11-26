@@ -933,7 +933,7 @@ func TestClientHandshakeTimeoutTriggersReset(t *testing.T) {
 
 func TestClientStreamIdleTimeoutTriggersResetAndClose(t *testing.T) {
 	srvConn, cliConn := net.Pipe()
-	cli := NewClientCodec(cliConn, WithTimeout(50*time.Millisecond))
+	cli := NewClientCodec(cliConn, WithIdleTimeout(50*time.Millisecond))
 	enc := gob.NewEncoder(srvConn)
 	dec := gob.NewDecoder(srvConn)
 	_ = enc.Encode(&frame{Type: responseHeader, Sequence: 72})
